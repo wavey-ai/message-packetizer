@@ -83,7 +83,7 @@ pub struct MessageSigner {
 
 impl MessageSigner {
     /// Create a new MessageSigner from a Base64-encoded PEM key
-    pub fn new(base64_encoded_pem_key: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn new(base64_encoded_pem_key: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let private_key = privkey_from_base64(base64_encoded_pem_key)?;
 
         // Derive a separate signing key using SHA-256
