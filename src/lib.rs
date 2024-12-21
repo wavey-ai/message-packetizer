@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use hmac::{Hmac, Mac};
 use pot::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ pub struct SignedMessageEnvelope {
 }
 
 impl SignedMessageEnvelope {
-    pub fn to_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> BytesMut {
         let mut buf = BytesMut::new();
         buf.put_u64(self.sequence);
         buf.put_u64(self.timestamp);
@@ -40,7 +40,7 @@ impl SignedMessageEnvelope {
         buf.extend_from_slice(&self.content);
         buf.put_u32(self.signature.len() as u32);
         buf.extend_from_slice(&self.signature);
-        buf.freeze()
+        buf
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
@@ -73,7 +73,7 @@ impl SignedMessageEnvelope {
         })
     }
 
-    pub fn to_packets(&self) -> Vec<Bytes> {
+    pub fn to_packets(&self) -> Vec<BytesMut> {
         let full_data = self.to_bytes();
         let mut packets = Vec::new();
         let mut remaining = full_data.as_ref();
@@ -89,7 +89,7 @@ impl SignedMessageEnvelope {
             packet.put_u32(packet_sequence); // packet sequence
             packet.extend_from_slice(chunk);
 
-            packets.push(packet.freeze());
+            packets.push(packet);
             remaining = rest;
             packet_sequence += 1;
         }
@@ -179,13 +179,61 @@ impl SignedMessageDemuxer {
             partial_messages: HashMap::new(),
         }
     }
+}
 
-    pub fn process_packet(
-        &mut self,
-        packet: &[u8],
-    ) -> Result<Option<SignedMessageEnvelope>, Box<dyn Error>> {
+#[derive(Debug)]
+pub enum DemuxError {
+    InvalidPacket(String),
+    MessageCorrupted {
+        sequence: u64,
+        reason: String,
+    },
+    EnvelopeParseError {
+        sequence: u64,
+        error: Box<dyn Error>,
+    },
+}
+
+impl std::fmt::Display for DemuxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DemuxError::InvalidPacket(msg) => write!(f, "Invalid packet: {}", msg),
+            DemuxError::MessageCorrupted { sequence, reason } => {
+                write!(f, "Message {} corrupted: {}", sequence, reason)
+            }
+            DemuxError::EnvelopeParseError { sequence, error } => {
+                write!(f, "Failed to parse message {}: {}", sequence, error)
+            }
+        }
+    }
+}
+
+impl Error for DemuxError {}
+
+#[derive(Debug)]
+pub struct DemuxResult {
+    pub messages: Vec<SignedMessageEnvelope>,
+    pub errors: Vec<DemuxError>,
+}
+
+impl DemuxResult {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+}
+
+impl SignedMessageDemuxer {
+    pub fn process_packet(&mut self, packet: &[u8]) -> DemuxResult {
+        let mut result = DemuxResult::new();
+
         if packet.len() < PACKET_HEADER_SIZE {
-            return Err("Packet too small".into());
+            result
+                .errors
+                .push(DemuxError::InvalidPacket("Packet too small".into()));
+            return result;
         }
 
         let mut buf = &packet[..];
@@ -204,35 +252,60 @@ impl SignedMessageDemuxer {
                 got_last: false,
             });
 
+        // Check for duplicate packet sequence
+        if message
+            .packets
+            .iter()
+            .any(|(seq, _)| *seq == packet_sequence)
+        {
+            result.errors.push(DemuxError::MessageCorrupted {
+                sequence: msg_sequence,
+                reason: format!("Duplicate packet sequence {}", packet_sequence),
+            });
+            self.partial_messages.remove(&msg_sequence);
+            return result;
+        }
+
         message.packets.push((packet_sequence, payload.clone()));
         message.total_size += payload.len();
         if is_last {
             message.got_last = true;
         }
 
-        if message.got_last {
-            let mut all_packets_received = true;
-            message.packets.sort_by_key(|(seq, _)| *seq);
-
-            // Check for gaps in sequence
-            let expected_sequences: Vec<_> = (0..message.packets.len() as u32).collect();
-            let actual_sequences: Vec<_> = message.packets.iter().map(|(seq, _)| *seq).collect();
-            if expected_sequences != actual_sequences {
-                all_packets_received = false;
-            }
-
-            if all_packets_received {
-                if let Some(message) = self.partial_messages.remove(&msg_sequence) {
-                    let mut combined = BytesMut::with_capacity(message.total_size);
-                    for (_, payload) in message.packets {
-                        combined.extend_from_slice(&payload);
-                    }
-                    return Ok(Some(SignedMessageEnvelope::from_bytes(&combined)?));
+        // Check all messages for completeness
+        let mut complete_sequences = Vec::new();
+        for (&sequence, message) in &mut self.partial_messages {
+            if message.got_last {
+                message.packets.sort_by_key(|(seq, _)| *seq);
+                let expected_sequences: Vec<_> = (0..message.packets.len() as u32).collect();
+                let actual_sequences: Vec<_> =
+                    message.packets.iter().map(|(seq, _)| *seq).collect();
+                if expected_sequences == actual_sequences {
+                    complete_sequences.push(sequence);
                 }
             }
         }
 
-        Ok(None)
+        // Process all complete messages
+        for sequence in complete_sequences {
+            if let Some(message) = self.partial_messages.remove(&sequence) {
+                let mut combined = BytesMut::with_capacity(message.total_size);
+                for (_, payload) in message.packets {
+                    combined.extend_from_slice(&payload);
+                }
+
+                match SignedMessageEnvelope::from_bytes(&combined) {
+                    Ok(envelope) => result.messages.push(envelope),
+                    Err(e) => {
+                        result
+                            .errors
+                            .push(DemuxError::EnvelopeParseError { sequence, error: e });
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     pub fn pending_message_count(&self) -> usize {
@@ -260,29 +333,88 @@ mod tests {
         let mut signer = MessageSigner::new(&std::env::var("PRIVKEY_PEM")?)?;
         let mut demuxer = SignedMessageDemuxer::new();
 
-        // Create and sign a large message
-        let original = TestMessage {
-            data: "x".repeat(2000),
+        // Create and sign multiple large messages
+        let msg1 = TestMessage {
+            data: "first".repeat(500),
         };
-        let envelope = signer.sign(&original)?;
+        let msg2 = TestMessage {
+            data: "second".repeat(500),
+        };
 
-        // Split into packets
-        let packets = envelope.to_packets();
-        assert!(packets.len() > 1); // Should be multiple packets
+        let env1 = signer.sign(&msg1)?;
+        let env2 = signer.sign(&msg2)?;
 
-        // Process packets through demuxer
-        for packet in &packets[..packets.len() - 1] {
-            assert!(demuxer.process_packet(packet)?.is_none());
+        // Split both into packets
+        let packets1 = env1.to_packets();
+        let packets2 = env2.to_packets();
+
+        assert!(packets1.len() > 1);
+        assert!(packets2.len() > 1);
+
+        // Process packets, interleaving between messages
+        for i in 0..packets1.len().max(packets2.len()) {
+            if i < packets1.len() {
+                let result = demuxer.process_packet(&packets1[i]);
+                assert!(result.errors.is_empty());
+                if i == packets1.len() - 1 {
+                    assert_eq!(result.messages.len(), 1);
+                    let decoded: TestMessage = signer.verify(&result.messages[0])?;
+                    assert_eq!(decoded, msg1);
+                } else {
+                    assert!(result.messages.is_empty());
+                }
+            }
+
+            if i < packets2.len() {
+                let result = demuxer.process_packet(&packets2[i]);
+                assert!(result.errors.is_empty());
+                if i == packets2.len() - 1 {
+                    assert_eq!(result.messages.len(), 1);
+                    let decoded: TestMessage = signer.verify(&result.messages[0])?;
+                    assert_eq!(decoded, msg2);
+                } else {
+                    assert!(result.messages.is_empty());
+                }
+            }
         }
 
-        // Last packet should complete the message
-        let reassembled = demuxer
-            .process_packet(&packets[packets.len() - 1])?
-            .unwrap();
-        let decoded: TestMessage = signer.verify(&reassembled)?;
-
-        assert_eq!(decoded, original);
         assert_eq!(demuxer.pending_message_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_error_handling() -> Result<(), Box<dyn Error>> {
+        let mut demuxer = SignedMessageDemuxer::new();
+
+        // Test invalid packet
+        let result = demuxer.process_packet(&[1, 2, 3]);
+        assert_eq!(result.messages.len(), 0);
+        assert_eq!(result.errors.len(), 1);
+        match &result.errors[0] {
+            DemuxError::InvalidPacket(_) => (),
+            _ => panic!("Expected InvalidPacket error"),
+        }
+
+        // Test duplicate packet sequence
+        let mut signer = MessageSigner::new(&std::env::var("PRIVKEY_PEM")?)?;
+        let msg = TestMessage {
+            data: "test".repeat(500),
+        };
+        let env = signer.sign(&msg)?;
+        let packets = env.to_packets();
+
+        // Send first packet twice
+        let result1 = demuxer.process_packet(&packets[0]);
+        assert!(result1.errors.is_empty());
+        let result2 = demuxer.process_packet(&packets[0]);
+        assert_eq!(result2.errors.len(), 1);
+        match &result2.errors[0] {
+            DemuxError::MessageCorrupted { sequence, .. } => {
+                assert_eq!(*sequence, env.sequence);
+            }
+            _ => panic!("Expected MessageCorrupted error"),
+        }
+
         Ok(())
     }
 }
