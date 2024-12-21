@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hmac::{Hmac, Mac};
 use pot::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ pub struct SignedMessageEnvelope {
 }
 
 impl SignedMessageEnvelope {
-    pub fn to_bytes(&self) -> BytesMut {
+    pub fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
         buf.put_u64(self.sequence);
         buf.put_u64(self.timestamp);
@@ -40,7 +40,7 @@ impl SignedMessageEnvelope {
         buf.extend_from_slice(&self.content);
         buf.put_u32(self.signature.len() as u32);
         buf.extend_from_slice(&self.signature);
-        buf
+        buf.freeze()
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
@@ -73,7 +73,7 @@ impl SignedMessageEnvelope {
         })
     }
 
-    pub fn to_packets(&self) -> Vec<BytesMut> {
+    pub fn to_packets(&self) -> Vec<Bytes> {
         let full_data = self.to_bytes();
         let mut packets = Vec::new();
         let mut remaining = full_data.as_ref();
@@ -89,7 +89,7 @@ impl SignedMessageEnvelope {
             packet.put_u32(packet_sequence); // packet sequence
             packet.extend_from_slice(chunk);
 
-            packets.push(packet);
+            packets.push(packet.freeze());
             remaining = rest;
             packet_sequence += 1;
         }
