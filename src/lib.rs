@@ -27,7 +27,7 @@ pub struct SignedMessageEnvelope {
 }
 
 impl SignedMessageEnvelope {
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> BytesMut {
         let mut buf = BytesMut::new();
         buf.put_u64(self.sequence);
         buf.put_u64(self.timestamp);
@@ -40,7 +40,7 @@ impl SignedMessageEnvelope {
         buf.put_u32(self.signature.len() as u32);
         buf.extend_from_slice(&self.signature);
 
-        buf.to_vec()
+        buf
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
