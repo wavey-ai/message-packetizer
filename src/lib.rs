@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_message_roundtrip() -> Result<(), Box<dyn Error>> {
-        let mut signer = MessageSigner::new(&std::env::var("PRIVKEY_PEM")?)?;
+        let mut signer = MessageSigner::new(&std::env::var("PRIVKEY_PEM").unwrap()).unwrap();
         let mut demuxer = SignedMessageDemuxer::new();
 
         // Create and sign multiple large messages
@@ -396,7 +396,7 @@ mod tests {
         }
 
         // Test duplicate packet sequence
-        let mut signer = MessageSigner::new(&std::env::var("PRIVKEY_PEM")?)?;
+        let mut signer = MessageSigner::new(&std::env::var("PRIVKEY_PEM").unwrap()).unwrap();
         let msg = TestMessage {
             data: "test".repeat(500),
         };

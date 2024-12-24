@@ -10,7 +10,7 @@ readme = "README.md"
 [dependencies]
 base64 = "0.22.1"
 bytes = "1.6.0"
-gen-id = { git = "ssh://git@github.com/wavey-ai/gen-id.git" }
+gen-id = "0.3.0"
 hmac = "0.12.1"
 minicbor = "0.25.1"
 pot = "3.0.1"
